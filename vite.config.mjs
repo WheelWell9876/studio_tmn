@@ -45,6 +45,9 @@ export default defineConfig(async () => {
         alias: {
           '@': path.resolve(pathSegments, './src'),
           '@root': path.resolve(pathSegments, './'),
+          // Beatlight workspace packages — built into ../packages/*/dist by tsc.
+          '@beatlight/cue-engine': path.resolve(pathSegments, '../packages/cue-engine/dist/index.js'),
+          '@beatlight/shared-types': path.resolve(pathSegments, '../packages/shared-types/dist/index.js'),
         },
         extensions: ['.mjs', '.js', '.ts', '.jsx', '.tsx', '.json', '.vue'],
       },

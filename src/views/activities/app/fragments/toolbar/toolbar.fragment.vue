@@ -5,6 +5,7 @@
     class="navigation_header"
   >
     <uk-menu :menus="menus" />
+    <beatlight-loader />
     <uk-spacer />
     <p>{{ saveState ? "" : "*" }} {{ project }}</p>
     <uk-spacer />

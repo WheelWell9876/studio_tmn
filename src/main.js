@@ -6,6 +6,7 @@ import EventBus from '@/plugins/eventbus';
 import '@/assets/styles/global.css';
 import '@/assets/styles/fonts.css';
 import ShowSingleton from '@/singletons/show.singleton';
+import { BeatlightBridge } from '@/plugins/beatlight-bridge';
 import router from './plugins/router';
 import App from './App.vue';
 
@@ -31,6 +32,7 @@ try {
     EventBus.emit('app_error', err);
   };
   app.use(router);
+  app.use(BeatlightBridge);
   app.mount('#app');
 } catch (err) {
   console.log(err);
