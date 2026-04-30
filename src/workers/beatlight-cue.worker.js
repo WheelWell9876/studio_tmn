@@ -1,28 +1,47 @@
 /* eslint-disable no-restricted-globals */
 /**
- * @file beatlight-cue.worker.js — pre-baked DMX frame lookup worker.
+ * @file beatlight-cue.worker.js — pre-baked DMX frame lookup with live overlay.
  *
- * v1 message protocol:
+ * Message protocol:
  *   { type: 'init', show }
  *     - Decodes show.pre_baked_dmx.frames_b64 once into a Uint8Array.
- *     - Stashes rate, channelCount, totalTicks for fast lookup.
+ *     - Stashes timeline, stage, knobs (defaulting to DEFAULT_TUNING) for
+ *       the live-overlay tick path.
  *
- *   { type: 'tick', t }
- *     - Look up the frame at index Math.floor(t * rate). Posts the 2048-byte
- *       channels slice back as a transferable ArrayBuffer.
+ *   { type: 'tick', t, live? }
+ *     - `live` is a LiveFeatures snapshot from MeydaService; defaults to
+ *       ZERO_LIVE when absent (Prompt-2 lookup-only behaviour).
+ *     - Looks up the baked frame at index Math.floor(t * rate).
+ *     - Calls tickLive(ctx) and HTP-merges with the baked frame, scaling
+ *       the live frame by knobs.liveOverlayStrength first.
+ *     - Posts the resulting 2048-byte frame back as a transferable.
  *
- * v1 is lookup-only — no `tick(ctx)` invocation, no live overlay. Prompt 3
- * adds the live merge path; the cue-engine `tick` import is wired here so
- * Prompt 3 can flip the switch without a structural rewrite.
+ *   { type: 'set-knobs', knobs }
+ *     - Partial knob update (e.g. from the Tuning Knobs Panel or background
+ *       calibration). Merged into the stashed knobs, next tick uses new
+ *       values.
+ *
+ *   { type: 'replace-prebake', frames_b64 }
+ *     - Section relabel re-bake — swaps the baked buffer mid-playback.
+ *
+ * Live-overlay math is HTP (highest takes precedence): the live frame can
+ * only raise a channel above its baked value, never lower it. This keeps the
+ * pre-bake as a deterministic floor and adds reactive sparkle on top.
  */
 
-// eslint-disable-next-line no-unused-vars
-import { tick } from '@beatlight/cue-engine';
+import {
+  DEFAULT_TUNING,
+  buildContext,
+  tickLive,
+} from '@beatlight/cue-engine';
 
 let baked = null;
 let rateHz = 44;
 let channelCount = 2048;
 let totalTicks = 0;
+let timeline = null;
+let stage = null;
+let knobs = DEFAULT_TUNING;
 
 function base64ToUint8Array(b64) {
   const bin = atob(b64);
@@ -31,21 +50,46 @@ function base64ToUint8Array(b64) {
   return out;
 }
 
+function applyPrebake(b64) {
+  baked = base64ToUint8Array(b64);
+  totalTicks = Math.floor(baked.length / channelCount);
+}
+
 self.addEventListener('message', (e) => {
   const data = e.data;
   if (!data || !data.type) return;
 
   if (data.type === 'init') {
-    const dmx = data.show && data.show.pre_baked_dmx;
+    const show = data.show;
+    const dmx = show && show.pre_baked_dmx;
     if (!dmx) {
       self.postMessage({ type: 'error', message: 'show.pre_baked_dmx missing' });
       return;
     }
-    baked = base64ToUint8Array(dmx.frames_b64);
     rateHz = dmx.rate_hz || 44;
     channelCount = dmx.channel_count || 2048;
-    totalTicks = Math.floor(baked.length / channelCount);
+    applyPrebake(dmx.frames_b64);
+    timeline = show.timeline || null;
+    stage = show.stage || null;
+    // Prompt-2-era shows have no `knobs`; merge any caller-provided onto the
+    // schema defaults so partial overrides are well-defined.
+    knobs = { ...DEFAULT_TUNING, ...(show.knobs || {}) };
     self.postMessage({ type: 'ready', totalTicks, rateHz, channelCount });
+    return;
+  }
+
+  if (data.type === 'set-knobs') {
+    if (data.knobs && typeof data.knobs === 'object') {
+      knobs = { ...knobs, ...data.knobs };
+    }
+    return;
+  }
+
+  if (data.type === 'replace-prebake') {
+    if (typeof data.frames_b64 === 'string') {
+      applyPrebake(data.frames_b64);
+      self.postMessage({ type: 'rebaked', totalTicks });
+    }
     return;
   }
 
@@ -55,11 +99,43 @@ self.addEventListener('message', (e) => {
     let idx = Math.floor(t * rateHz);
     if (idx < 0) idx = 0;
     if (idx >= totalTicks) idx = totalTicks - 1;
-    // Copy into a fresh ArrayBuffer so we can transfer ownership and
-    // avoid corrupting the master baked buffer.
     const start = idx * channelCount;
-    const buf = new ArrayBuffer(channelCount);
-    new Uint8Array(buf).set(baked.subarray(start, start + channelCount));
+
+    const out = new Uint8Array(channelCount);
+    out.set(baked.subarray(start, start + channelCount));
+
+    // Live overlay path — only when timeline + stage are stashed (they are
+    // after init; this guards against `tick` arriving before init lands).
+    const live = data.live || null;
+    const haveLive =
+      live && (live.rms || live.low || live.flux || live.mid || live.highMid);
+    if (haveLive && timeline && stage) {
+      const ctx = buildContext({
+        timeline,
+        stage,
+        t,
+        live,
+        knobs,
+      });
+      const frame = tickLive(ctx);
+      const strength = knobs.liveOverlayStrength;
+      if (strength > 0) {
+        const liveBytes = frame.channels;
+        for (let i = 0; i < channelCount; i += 1) {
+          // Scale + round-with-bias: (x*s + 0.5) | 0 is ~3× faster than
+          // Math.round per byte and equivalent for non-negative inputs.
+          const l = (liveBytes[i] * strength + 0.5) | 0;
+          if (l > out[i]) out[i] = l;
+        }
+      }
+    } else if (haveLive && (!timeline || !stage)) {
+      // tick fired before init completed — ignore the live overlay this
+      // frame; the baked frame still posts so playback doesn't stall.
+    }
+
+    // Post in the existing v1 envelope so BeatlightAdapter.applyFrame
+    // contracts don't change.
+    const buf = out.buffer;
     self.postMessage({ type: 'frame', t, idx, buffer: buf }, [buf]);
   }
 });
