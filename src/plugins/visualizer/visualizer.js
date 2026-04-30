@@ -3,13 +3,32 @@
 import * as THREE from 'three';
 
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import Stats from 'stats.js';
 import ModelInstancer from './model_instancer';
 import SceneManager from './scene_manager';
 import AnimationManager from './animation_manager';
 import Controls from './controls';
 import MovingHead from './moving_head';
+import StrobePanel from './strobe_panel';
+import ColorChangerPar from './color_changer_par';
+import SmokeHazer from './smoke_hazer';
+import LaserEmitter from './laser_emitter';
+import EffectFallback from './effect_fallback';
 import InfiniteGridHelper from './grid';
+
+const QUALITY_KEY = 'beatlight_quality';
+const QUALITY_VALUES = ['low', 'medium', 'high'];
+
+function readStoredQuality() {
+  try {
+    const v = window.localStorage.getItem(QUALITY_KEY);
+    if (QUALITY_VALUES.includes(v)) return v;
+  } catch (_) { /* localStorage unavailable */ }
+  return 'low';
+}
 
 /**
  * THREE.Vector3 round prototype override.
@@ -58,6 +77,9 @@ class Visualizer {
     this.controls = null;
     this.animation = null;
     this.finalComposer = null;
+    this.composer = null;
+    this.bloomPass = null;
+    this._quality = readStoredQuality();
     this.globalBrightness = 100;
     this.globalLightHandle = null;
     this.autoRotate = false;
@@ -66,6 +88,21 @@ class Visualizer {
     this.stats.showPanel(0);
     this.stats.dom.style.position = 'absolute';
   }
+
+  /**
+   * Render quality:
+   *   low    — direct render, no post-processing (default per Plan-01
+   *            lightweight-perf constraint; targets 60 fps on integrated GPU)
+   *   medium — UnrealBloomPass enabled
+   *   high   — bloom + future god-rays (gated behind explicit opt-in)
+   */
+  set quality(mode) {
+    if (!QUALITY_VALUES.includes(mode)) return;
+    this._quality = mode;
+    try { window.localStorage.setItem(QUALITY_KEY, mode); } catch (_) { /* noop */ }
+    if (this.bloomPass) this.bloomPass.enabled = mode !== 'low';
+  }
+  get quality() { return this._quality; }
 
   /**
    * Initialises WebGL Visualizer instance
@@ -78,6 +115,7 @@ class Visualizer {
     this.prepareRenderer();
     this.prepareCamera();
     this.prepareControls();
+    this.prepareComposer();
     this.resize();
     Controls.init(this.camera, this.domElement, this.controls);
     this.startRender();
@@ -246,9 +284,19 @@ class Visualizer {
     this.globalLightHandle.position.set(-10, -10, 10);
 
     MovingHead.prepareInstanciation(this.camera, SceneManager);
+    StrobePanel.prepareInstanciation(this.camera, SceneManager);
+    ColorChangerPar.prepareInstanciation(this.camera, SceneManager);
+    SmokeHazer.prepareInstanciation(this.camera, SceneManager);
+    LaserEmitter.prepareInstanciation(this.camera, SceneManager);
+    EffectFallback.prepareInstanciation(this.camera, SceneManager);
 
     AnimationManager.add((t) => {
       MovingHead.update(t);
+      StrobePanel.update(t);
+      ColorChangerPar.update(t);
+      SmokeHazer.update(t);
+      LaserEmitter.update(t);
+      EffectFallback.update(t);
     });
 
     // Floor
@@ -307,6 +355,29 @@ class Visualizer {
   }
 
   /**
+   * Build the post-processing chain: a RenderPass for the scene + an
+   * UnrealBloomPass that's gated by `qualityMode`. Direct render is used
+   * for `quality === 'low'`; the composer is used for medium/high.
+   * Beam materials set `toneMapped: false` so the bloom-pass tonemap
+   * doesn't crush the additive volumetric beams.
+   */
+  prepareComposer() {
+    const w = this.domElement.offsetWidth;
+    const h = this.domElement.clientHeight;
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.setSize(w, h);
+    this.composer.addPass(new RenderPass(SceneManager, this.camera));
+    this.bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(w, h),
+      0.6, // strength
+      0.4, // radius
+      0.85, // threshold
+    );
+    this.bloomPass.enabled = this._quality !== 'low';
+    this.composer.addPass(this.bloomPass);
+  }
+
+  /**
    * Prepares Visualizer's camera
    *
    * @public
@@ -355,8 +426,12 @@ class Visualizer {
       this.width = width;
       this.height = height;
       this.renderer.setSize(width, height);
+      if (this.composer) this.composer.setSize(width, height);
       this.camera.aspect = aspect;
       this.camera.updateProjectionMatrix();
+      // Line2 / LineMaterial uses screen-space units; refresh on resize so
+      // laser thickness stays consistent across viewport sizes.
+      LaserEmitter.onResize(width, height);
     }
   }
 
@@ -366,7 +441,11 @@ class Visualizer {
    * @public
    */
   render() {
-    this.renderer.render(SceneManager, this.camera);
+    if (this._quality !== 'low' && this.composer) {
+      this.composer.render();
+    } else {
+      this.renderer.render(SceneManager, this.camera);
+    }
   }
 }
 

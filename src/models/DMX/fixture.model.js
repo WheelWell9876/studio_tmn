@@ -3,6 +3,11 @@ import {
 } from '../utils/proxify.utils';
 import Channel from './channel.model';
 import MovingHead from '../../plugins/visualizer/moving_head';
+import StrobePanel from '../../plugins/visualizer/strobe_panel';
+import ColorChangerPar from '../../plugins/visualizer/color_changer_par';
+import SmokeHazer from '../../plugins/visualizer/smoke_hazer';
+import LaserEmitter from '../../plugins/visualizer/laser_emitter';
+import EffectFallback from '../../plugins/visualizer/effect_fallback';
 import Controls from '../../plugins/visualizer/controls';
 
 /**
@@ -80,6 +85,12 @@ const WHEEL_CHANNEL_TYPES = {
  */
 const FIXTURE_TYPES = {
   MOVING_HEAD: 'Moving Head',
+  STROBE: 'Strobe',
+  COLOR_CHANGER: 'Color Changer',
+  WASH: 'Wash',
+  SMOKE: 'Smoke',
+  LASER: 'Laser',
+  EFFECT: 'Effect',
 };
 
 /**
@@ -709,9 +720,10 @@ class Fixture extends Proxify {
    * @todo implement every fixture type
    */
   prepare3DModelInstance() {
+    let model = null;
     switch (this.category) { // Checking fixture category
       case FIXTURE_TYPES.MOVING_HEAD: { // Fixture is a moving head
-        const movingHead = new MovingHead({ // Creating new moving head instance
+        model = new MovingHead({ // Creating new moving head instance
           minAngle: this.OFLData.physical.lens ? this.OFLData.physical.lens.degreesMinMax[0] : 10, // Setting moving head's minimum beam angle
           maxAngle: this.OFLData.physical.lens ? this.OFLData.physical.lens.degreesMinMax[1] : 25, // Setting moving head's maximum beam angle
           minTilt: this.quickChannelsAccessors.Tilt ? this.quickChannelsAccessors.Tilt[0].minVal : 0,
@@ -725,15 +737,25 @@ class Fixture extends Proxify {
           colorWheel: this.OFLData.wheels && this.OFLData.wheels['Color Wheel'] ? this.OFLData.wheels['Color Wheel'].slots : [], // Providing color wheel data (if necessary)
           goboWheel: this.OFLData.wheels && this.OFLData.wheels['Gobo Wheel'] ? this.OFLData.wheels['Gobo Wheel'].slots : [], // Providing gobo wheel data (if necessary) (not supported in renderer yet...)
         });
-        movingHead.position = this._position; // Setting moving head's position in 3D space
-        movingHead.rotation = this._rotation; // Setting moving head's rotation in 3D space
-        this._3DModel = movingHead; // Binding moving head instance to this fixture instance
         break;
       }
-      default: { // Do nothing for every other fixture types.
-        throw new Error('This fixture type is not supported yet.');
-      }
+      case FIXTURE_TYPES.STROBE: model = new StrobePanel(); break;
+      case FIXTURE_TYPES.COLOR_CHANGER:
+      case FIXTURE_TYPES.WASH:
+        model = new ColorChangerPar({
+          colorWheel: this.OFLData.wheels && this.OFLData.wheels['Color Wheel']
+            ? this.OFLData.wheels['Color Wheel'].slots
+            : [],
+        });
+        break;
+      case FIXTURE_TYPES.SMOKE: model = new SmokeHazer(); break;
+      case FIXTURE_TYPES.LASER: model = new LaserEmitter(); break;
+      case FIXTURE_TYPES.EFFECT: model = new EffectFallback({ category: this.category }); break;
+      default: model = new EffectFallback({ category: this.category }); break;
     }
+    model.position = this._position;
+    model.rotation = this._rotation;
+    this._3DModel = model;
   }
 
   /**
@@ -855,7 +877,24 @@ class Fixture extends Proxify {
       case FIXTURE_TYPES.MOVING_HEAD:
         MovingHead.deleteInstance(instance._3DModel);
         break;
+      case FIXTURE_TYPES.STROBE:
+        StrobePanel.deleteInstance(instance._3DModel);
+        break;
+      case FIXTURE_TYPES.COLOR_CHANGER:
+      case FIXTURE_TYPES.WASH:
+        ColorChangerPar.deleteInstance(instance._3DModel);
+        break;
+      case FIXTURE_TYPES.SMOKE:
+        SmokeHazer.deleteInstance(instance._3DModel);
+        break;
+      case FIXTURE_TYPES.LASER:
+        LaserEmitter.deleteInstance(instance._3DModel);
+        break;
+      case FIXTURE_TYPES.EFFECT:
+        EffectFallback.deleteInstance(instance._3DModel);
+        break;
       default:
+        EffectFallback.deleteInstance(instance._3DModel);
         break;
     }
     instance = null;

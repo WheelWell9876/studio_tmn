@@ -19,6 +19,13 @@
     >
       Load New Show
     </button>
+    <button
+      class="beatlight_button beatlight_button_secondary"
+      title="Cycle visualizer quality (low → medium → high). Bloom & god-rays are off at low for max FPS."
+      @click="cycleQuality"
+    >
+      Q: {{ quality }}
+    </button>
     <div
       v-if="status"
       class="beatlight_status"
@@ -115,6 +122,9 @@ export default {
       // Playback indicator state (polled, not RAF) — see _startStatusPoll.
       currentTime: 0,
       liveRms: 0,
+      // Visualizer quality (bloom + god-rays gating). Hydrated from the
+      // visualizer instance once it mounts.
+      quality: 'low',
       _liveErrorReported: false,
       _boostRampHandle: null,
       _statusPollHandle: null,
@@ -150,17 +160,35 @@ export default {
     this._onRecalibrate = () => this._startBackgroundCalibration();
     this._onCancelCal = () => meydaService.cancelCalibration();
     this._onRebake = (payload) => this._handleRebake(payload);
+    this._onVisualizerLoaded = () => this._syncQualityFromVisualizer();
     this._currentKnobs = null; // last applied knobs cache, used during rebake
     EventBus.on('beatlight:set-knobs', this._onSetKnobs);
     EventBus.on('beatlight:recalibrate', this._onRecalibrate);
     EventBus.on('beatlight:cancel-calibration', this._onCancelCal);
     EventBus.on('beatlight:rebake', this._onRebake);
+    EventBus.on('visualizer_loaded', this._onVisualizerLoaded);
+    // Hydrate immediately if visualizer is already mounted (race-safe).
+    this._syncQualityFromVisualizer();
+    // Expose a small debug surface for Playwright e2e specs and console
+    // debugging. Read-only-ish — tests should drive UI, not mutate state
+    // directly, but having visibility into the live state helps assertions.
+    window.__beatlight = {
+      get worker() { return /** @type {any} */ (window.__beatlight)._workerRef || null; },
+      get adapter() { return beatlightAdapter; },
+      get meyda() { return meydaService; },
+      get show() { return /** @type {any} */ (window.__beatlight)._showRef || null; },
+      get quality() {
+        const viz = (window.$show || {}).visualizerHandle;
+        return viz ? viz.quality : null;
+      },
+    };
   },
   beforeUnmount() {
     EventBus.off('beatlight:set-knobs', this._onSetKnobs);
     EventBus.off('beatlight:recalibrate', this._onRecalibrate);
     EventBus.off('beatlight:cancel-calibration', this._onCancelCal);
     EventBus.off('beatlight:rebake', this._onRebake);
+    EventBus.off('visualizer_loaded', this._onVisualizerLoaded);
     this.teardown();
   },
   methods: {
@@ -181,6 +209,20 @@ export default {
       if (this.busy) return;
       await this.teardown();
       this.$refs.showInput.click();
+    },
+
+    cycleQuality() {
+      const order = ['low', 'medium', 'high'];
+      const idx = order.indexOf(this.quality);
+      const next = order[(idx + 1) % order.length];
+      this.quality = next;
+      const viz = this.$show && this.$show.visualizerHandle;
+      if (viz) viz.quality = next;
+    },
+
+    _syncQualityFromVisualizer() {
+      const viz = this.$show && this.$show.visualizerHandle;
+      if (viz && viz.quality) this.quality = viz.quality;
     },
 
     async onShowSelected(e) {
@@ -475,6 +517,11 @@ export default {
       worker.postMessage({ type: 'init', show: rawShow });
       this.worker = worker;
       this.ready = false;
+      // Update the debug surface so e2e specs can find the live worker.
+      if (window.__beatlight) {
+        window.__beatlight._workerRef = worker;
+        window.__beatlight._showRef = rawShow;
+      }
     },
 
     startTickLoop() {
