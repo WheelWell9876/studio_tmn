@@ -10,11 +10,53 @@
     >
       {{ buttonLabel }}
     </button>
+    <button
+      v-if="show"
+      class="beatlight_button beatlight_button_secondary"
+      :disabled="busy"
+      @click="loadNewShow"
+      title="Tear down current show and load a new one"
+    >
+      Load New Show
+    </button>
     <div
       v-if="status"
       class="beatlight_status"
     >
       {{ status }}
+    </div>
+    <div
+      v-if="calibrating"
+      class="beatlight_pill"
+      title="Sampling live overlay levels — adjusts liveBoost based on the song"
+    >
+      Calibrating live overlay…
+    </div>
+    <div
+      v-if="calibratedBoost != null && !calibrating"
+      class="beatlight_pill beatlight_pill_quiet"
+      :title="`Auto-calibrated liveBoost: ${calibratedBoost.toFixed(2)}`"
+    >
+      boost {{ calibratedBoost.toFixed(2) }}
+    </div>
+    <div
+      v-if="audioEl"
+      class="beatlight_playback"
+    >
+      <span
+        class="beatlight_live_dot"
+        :style="{ opacity: 0.3 + 0.7 * liveRms }"
+        title="Live RMS — pulses with the audio"
+      />
+      <span class="beatlight_playback_section">
+        {{ currentSectionLabel }}
+      </span>
+      <span
+        v-if="timeToNextDrop != null"
+        class="beatlight_playback_drop"
+      >
+        next drop in {{ timeToNextDrop.toFixed(1) }}s
+      </span>
     </div>
     <input
       ref="showInput"
@@ -42,8 +84,16 @@
 
 <script>
 import { markRaw } from 'vue';
+import EventBus from '@/plugins/eventbus';
 import beatlightAdapter from '@/services/BeatlightAdapter';
+import meydaService from '@/services/MeydaService';
 import CueWorker from '@/workers/beatlight-cue.worker.js?worker';
+import RebakeWorker from '@/workers/beatlight-rebake.worker.js?worker';
+
+/** Smoothly ramp `liveBoost` toward target — caps rate-of-change to ~1/sec. */
+const BOOST_RAMP_PER_SEC = 1.0;
+const BOOST_RAMP_INTERVAL_MS = 50;
+const CALIBRATION_WINDOW_SECONDS = 10;
 
 export default {
   name: 'BeatlightLoader',
@@ -54,21 +104,63 @@ export default {
       show: null,
       audioEl: null,
       audioObjectUrl: null,
+      audioContext: null,
       worker: null,
       rafHandle: null,
       lastTickIdx: -1,
       ready: false,
       needsPlayClick: false,
+      calibrating: false,
+      calibratedBoost: null,
+      // Playback indicator state (polled, not RAF) — see _startStatusPoll.
+      currentTime: 0,
+      liveRms: 0,
+      _liveErrorReported: false,
+      _boostRampHandle: null,
+      _statusPollHandle: null,
     };
   },
   computed: {
     buttonLabel() {
       if (!this.show) return '1. Pick .show.json';
       if (!this.audioEl) return '2. Pick audio (mp3/wav)';
-      return 'Reload';
+      return 'Reload audio';
+    },
+    currentSectionLabel() {
+      if (!this.show || !this.show.timeline || !Array.isArray(this.show.timeline.sections)) {
+        return '—';
+      }
+      const t = this.currentTime;
+      const sec = this.show.timeline.sections.find(
+        (s) => t >= s.start && t < s.end,
+      );
+      return sec ? sec.kind : '—';
+    },
+    timeToNextDrop() {
+      if (!this.show || !this.show.timeline || !Array.isArray(this.show.timeline.drops)) {
+        return null;
+      }
+      const t = this.currentTime;
+      const next = this.show.timeline.drops.find((d) => d.time > t);
+      return next ? next.time - t : null;
     },
   },
+  mounted() {
+    this._onSetKnobs = (partial) => this._postKnobs(partial);
+    this._onRecalibrate = () => this._startBackgroundCalibration();
+    this._onCancelCal = () => meydaService.cancelCalibration();
+    this._onRebake = (payload) => this._handleRebake(payload);
+    this._currentKnobs = null; // last applied knobs cache, used during rebake
+    EventBus.on('beatlight:set-knobs', this._onSetKnobs);
+    EventBus.on('beatlight:recalibrate', this._onRecalibrate);
+    EventBus.on('beatlight:cancel-calibration', this._onCancelCal);
+    EventBus.on('beatlight:rebake', this._onRebake);
+  },
   beforeUnmount() {
+    EventBus.off('beatlight:set-knobs', this._onSetKnobs);
+    EventBus.off('beatlight:recalibrate', this._onRecalibrate);
+    EventBus.off('beatlight:cancel-calibration', this._onCancelCal);
+    EventBus.off('beatlight:rebake', this._onRebake);
     this.teardown();
   },
   methods: {
@@ -80,7 +172,14 @@ export default {
         return;
       }
       // Reset state if we already had a show — user wants to load a new one.
-      this.teardown();
+      this.teardown().then(() => {
+        this.$refs.showInput.click();
+      });
+    },
+
+    async loadNewShow() {
+      if (this.busy) return;
+      await this.teardown();
       this.$refs.showInput.click();
     },
 
@@ -103,6 +202,11 @@ export default {
         this.status = `Patching ${parsed.stage.fixtures.length} fixtures into ${this.universeCount(parsed)} universes…`;
         await beatlightAdapter.loadShow(parsed);
         this.spawnWorker(parsed);
+        EventBus.emit('beatlight:show-loaded', {
+          knobs: parsed.knobs || null,
+          timeline: parsed.timeline,
+          trackTitle: (parsed.timeline && parsed.timeline.track && parsed.timeline.track.title) || parsed.title || 'song',
+        });
         this.status = 'Show loaded. Pick audio file to start playback.';
         this.busy = false;
         this.$refs.audioInput.click();
@@ -160,12 +264,16 @@ export default {
         audio.load();
         await ready;
         this.audioEl = audio;
+        // Construct AudioContext inside the same user-gesture call chain that
+        // handled the file pick — autoplay rules permit Web Audio creation
+        // here, which they wouldn't on a later async tick.
+        this.audioContext = new AudioContext();
         // `audio.play()` returns a promise that may reject due to browser
         // autoplay policy. Surface that as a "click to play" button rather
         // than failing silently.
         try {
           await audio.play();
-          this.startTickLoop();
+          await this._attachMeydaAndStart();
           this.status = `Playing — ${file.name}`;
         } catch (playErr) {
           // eslint-disable-next-line no-console
@@ -188,13 +296,156 @@ export default {
       try {
         await this.audioEl.play();
         this.needsPlayClick = false;
-        this.startTickLoop();
+        await this._attachMeydaAndStart();
         this.status = `Playing — ${this.audioEl.src.split('/').pop()}`;
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error('[Beatlight] play() rejected on user click', err);
         this.status = `Could not start playback: ${err.message || err}`;
       }
+    },
+
+    /**
+     * Wire Meyda onto the playing audio element, kick off background
+     * calibration (no UX wait), and start the RAF tick loop.
+     *
+     * Idempotent — safe to call after `resumePlayback` re-runs play().
+     */
+    async _attachMeydaAndStart() {
+      if (!meydaService.isAttached) {
+        try {
+          await meydaService.attach(this.audioEl, this.audioContext);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[Beatlight] Meyda attach failed; live overlay disabled', err);
+          this.status = 'Live overlay disabled — Meyda attach failed.';
+        }
+      }
+      this.startTickLoop();
+      this._startBackgroundCalibration();
+      this._startStatusPoll();
+    },
+
+    /**
+     * Poll currentTime + liveRms at 10 Hz for the playback indicator. Cheap
+     * (two reactive writes per 100 ms) and decoupled from the worker tick
+     * loop, which runs at 60 Hz (too fast for the UI).
+     */
+    _startStatusPoll() {
+      if (this._statusPollHandle) clearInterval(this._statusPollHandle);
+      this._statusPollHandle = setInterval(() => {
+        if (!this.audioEl) return;
+        this.currentTime = this.audioEl.currentTime;
+        try {
+          this.liveRms = meydaService.read().rms || 0;
+        } catch (_) {
+          this.liveRms = 0;
+        }
+      }, 100);
+    },
+
+    _startBackgroundCalibration() {
+      if (this.calibrating) return;
+      if (!meydaService.isAttached) return;
+      this.calibrating = true;
+      meydaService.calibrateBoost({
+        windowSeconds: CALIBRATION_WINDOW_SECONDS,
+        timeline: this.show ? this.show.timeline : null,
+      })
+        .then((boost) => {
+          this.calibrating = false;
+          if (boost == null) return; // user-overridden
+          this.calibratedBoost = boost;
+          EventBus.emit('beatlight:liveBoost-calibrated', { boost });
+          this._rampBoost(boost);
+        })
+        .catch((err) => {
+          this.calibrating = false;
+          // eslint-disable-next-line no-console
+          console.warn('[Beatlight] calibration failed', err);
+        });
+    },
+
+    /**
+     * Smoothly transition `knobs.liveBoost` from its current value (default
+     * 2.0) to `target`. Step every BOOST_RAMP_INTERVAL_MS by an amount that
+     * caps overall rate at BOOST_RAMP_PER_SEC.
+     */
+    _rampBoost(target) {
+      if (this._boostRampHandle) {
+        clearInterval(this._boostRampHandle);
+        this._boostRampHandle = null;
+      }
+      let current = 2.0; // Schema default — mirrors DEFAULT_TUNING.liveBoost.
+      const step = (BOOST_RAMP_PER_SEC * BOOST_RAMP_INTERVAL_MS) / 1000;
+      this._boostRampHandle = setInterval(() => {
+        const delta = target - current;
+        if (Math.abs(delta) <= step) {
+          current = target;
+          this._postKnobs({ liveBoost: current });
+          clearInterval(this._boostRampHandle);
+          this._boostRampHandle = null;
+          return;
+        }
+        current += Math.sign(delta) * step;
+        this._postKnobs({ liveBoost: current });
+      }, BOOST_RAMP_INTERVAL_MS);
+    },
+
+    _postKnobs(partial) {
+      if (!this.worker) return;
+      this.worker.postMessage({ type: 'set-knobs', knobs: partial });
+      // Cache the last-applied knobs so rebake worker uses the same tuning
+      // (otherwise rebake would always use the show file's defaults).
+      this._currentKnobs = { ...(this._currentKnobs || {}), ...partial };
+    },
+
+    /**
+     * Handle a section-relabel event: build a new timeline with the updated
+     * section kinds, spawn the rebake worker, hot-swap the playback worker's
+     * baked frames + timeline so the live overlay also picks up the new
+     * section layout. Audio playback is uninterrupted.
+     */
+    _handleRebake(payload) {
+      if (!this.show || !this.worker) return;
+      const sections = (payload && payload.sections) || null;
+      if (!Array.isArray(sections)) return;
+      const newTimeline = {
+        ...this.show.timeline,
+        sections,
+      };
+      const stage = this.show.stage;
+      const knobs = this._currentKnobs || this.show.knobs || null;
+      this.status = 'Re-baking with new section layout…';
+      const rebakeWorker = new RebakeWorker();
+      rebakeWorker.addEventListener('message', (e) => {
+        const m = e.data;
+        if (!m) return;
+        if (m.type === 'rebaked') {
+          // Forward to playback worker as a transferable.
+          this.worker.postMessage(
+            { type: 'replace-prebake', frames: m.frames, timeline: newTimeline },
+            [m.frames],
+          );
+          // Mutate local show to keep state in sync (sections + timeline).
+          this.show.timeline = markRaw(newTimeline);
+          EventBus.emit('beatlight:rebake-complete');
+          this.status = 'Re-bake complete.';
+          rebakeWorker.terminate();
+        } else if (m.type === 'error') {
+          // eslint-disable-next-line no-console
+          console.error('[Beatlight] rebake worker error', m.message);
+          this.status = `Re-bake failed: ${m.message}`;
+          EventBus.emit('beatlight:rebake-failed', { message: m.message });
+          rebakeWorker.terminate();
+        }
+      });
+      rebakeWorker.postMessage({
+        type: 'rebake',
+        timeline: newTimeline,
+        stage,
+        knobs,
+      });
     },
 
     spawnWorker(rawShow) {
@@ -213,6 +464,8 @@ export default {
           if (m.idx === this.lastTickIdx) return; // dedupe
           this.lastTickIdx = m.idx;
           beatlightAdapter.applyFrame(new Uint8Array(m.buffer));
+        } else if (m.type === 'rebaked') {
+          this.status = `Re-baked (${m.totalTicks} ticks).`;
         } else if (m.type === 'error') {
           this.status = `Worker error: ${m.message}`;
         }
@@ -228,7 +481,23 @@ export default {
       const tick = () => {
         if (!this.audioEl || !this.worker) return;
         if (!this.audioEl.paused && !this.audioEl.ended) {
-          this.worker.postMessage({ type: 'tick', t: this.audioEl.currentTime });
+          let live = null;
+          try {
+            live = meydaService.read();
+          } catch (err) {
+            if (!this._liveErrorReported) {
+              this._liveErrorReported = true;
+              // eslint-disable-next-line no-console
+              console.error('[Beatlight] meydaService.read() threw — live overlay disabled', err);
+              this.status = 'Live overlay disabled — Meyda error.';
+            }
+            live = null;
+          }
+          this.worker.postMessage({
+            type: 'tick',
+            t: this.audioEl.currentTime,
+            live,
+          });
         }
         this.rafHandle = requestAnimationFrame(tick);
       };
@@ -242,11 +511,22 @@ export default {
       return ids.size;
     },
 
-    teardown() {
+    async teardown() {
       if (this.rafHandle != null) {
         cancelAnimationFrame(this.rafHandle);
         this.rafHandle = null;
       }
+      if (this._boostRampHandle) {
+        clearInterval(this._boostRampHandle);
+        this._boostRampHandle = null;
+      }
+      if (this._statusPollHandle) {
+        clearInterval(this._statusPollHandle);
+        this._statusPollHandle = null;
+      }
+      this.currentTime = 0;
+      this.liveRms = 0;
+      meydaService.detach();
       if (this.worker) {
         this.worker.terminate();
         this.worker = null;
@@ -259,10 +539,23 @@ export default {
         URL.revokeObjectURL(this.audioObjectUrl);
         this.audioObjectUrl = null;
       }
+      // audioContext is closed by meydaService.detach() since attach took
+      // ownership of it; null the field so a fresh context is built next load.
+      this.audioContext = null;
+      try {
+        await beatlightAdapter.unloadShow();
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[Beatlight] unloadShow threw', err);
+      }
       this.show = null;
       this.ready = false;
       this.lastTickIdx = -1;
+      this.calibrating = false;
+      this.calibratedBoost = null;
+      this._liveErrorReported = false;
       this.status = '';
+      EventBus.emit('beatlight:show-unloaded');
     },
   },
 };
@@ -286,6 +579,9 @@ export default {
   letter-spacing: 0.5px;
   cursor: pointer;
 }
+.beatlight_button_secondary {
+  background: var(--secondary-dark, #555);
+}
 .beatlight_button:disabled {
   opacity: 0.5;
   cursor: progress;
@@ -302,6 +598,20 @@ export default {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.beatlight_pill {
+  background: var(--primary-light, #1f2a36);
+  color: var(--accent-gold, #d4a017);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  border: 1px solid var(--accent-gold, #d4a017);
+  padding: 3px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.beatlight_pill_quiet {
+  color: var(--primary-text, #ddd);
+  border-color: var(--primary-dark, #333);
+}
 .beatlight_play_button {
   background: var(--accent-gold, #d4a017);
   color: #000;
@@ -315,5 +625,31 @@ export default {
 }
 .beatlight_play_button:hover {
   filter: brightness(1.1);
+}
+.beatlight_playback {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 0 8px;
+  border-left: 1px solid var(--primary-dark, #15202b);
+}
+.beatlight_live_dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-sea-green, #4ec9b0);
+  display: inline-block;
+  transition: opacity 0.05s linear;
+}
+.beatlight_playback_section {
+  color: var(--accent-sea-green, #4ec9b0);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.beatlight_playback_drop {
+  color: var(--accent-gold, #d4a017);
+  font-variant-numeric: tabular-nums;
 }
 </style>

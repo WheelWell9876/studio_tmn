@@ -50,8 +50,16 @@ function base64ToUint8Array(b64) {
   return out;
 }
 
-function applyPrebake(b64) {
-  baked = base64ToUint8Array(b64);
+function applyPrebake(input) {
+  if (input instanceof Uint8Array) {
+    baked = input;
+  } else if (input instanceof ArrayBuffer) {
+    baked = new Uint8Array(input);
+  } else if (typeof input === 'string') {
+    baked = base64ToUint8Array(input);
+  } else {
+    return;
+  }
   totalTicks = Math.floor(baked.length / channelCount);
 }
 
@@ -86,10 +94,15 @@ self.addEventListener('message', (e) => {
   }
 
   if (data.type === 'replace-prebake') {
-    if (typeof data.frames_b64 === 'string') {
+    if (data.frames) {
+      applyPrebake(data.frames);
+    } else if (typeof data.frames_b64 === 'string') {
       applyPrebake(data.frames_b64);
-      self.postMessage({ type: 'rebaked', totalTicks });
+    } else {
+      return;
     }
+    if (data.timeline) timeline = data.timeline;
+    self.postMessage({ type: 'rebaked', totalTicks });
     return;
   }
 

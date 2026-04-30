@@ -166,6 +166,33 @@ class BeatlightAdapter {
   get isLoaded() {
     return this._loaded;
   }
+
+  /**
+   * Tear down the currently mounted show: zero every patched universe so
+   * each fixture's `setChannel` cascade pulls visuals to dark, await one
+   * render frame so the meshes actually update, then call ASLS's pool-clear
+   * which invokes each fixture's `deleteInstance` static (each mesh class
+   * is responsible for its own Three.js geometry/material disposal).
+   *
+   * Safe to call when no show is loaded.
+   */
+  async unloadShow() {
+    if (!this._loaded) return;
+    for (const universe of this._universesById.values()) {
+      try {
+        universe.DMX512Data = new Uint8Array(512);
+      } catch (_) { /* universe might already be detached; ignore */ }
+    }
+    await new Promise((r) => requestAnimationFrame(r));
+    try {
+      ShowSingleton.clearShowData();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[BeatlightAdapter] clearShowData threw on unload', err);
+    }
+    this._universesById.clear();
+    this._loaded = false;
+  }
 }
 
 // Singleton — there's one studio per page; keeping a single adapter avoids

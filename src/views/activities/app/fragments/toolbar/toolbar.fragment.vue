@@ -6,6 +6,8 @@
   >
     <uk-menu :menus="menus" />
     <beatlight-loader />
+    <section-relabel-panel />
+    <tuning-knobs-panel />
     <uk-spacer />
     <p>{{ saveState ? "" : "*" }} {{ project }}</p>
     <uk-spacer />
